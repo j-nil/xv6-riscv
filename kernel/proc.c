@@ -4,7 +4,9 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "proc_macros.h"
 #include "defs.h"
+#include "ptrace.h"
 
 struct cpu cpus[NCPU];
 
@@ -119,6 +121,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->traceflags.traceable = 0;
+  p->traceflags.syscall = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -164,6 +168,8 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->traceflags.traceable = 0;
+  p->traceflags.syscall = 0;
 }
 
 // Create a user page table for a given process,
@@ -427,6 +433,73 @@ wait(uint64 addr)
   }
 }
 
+// Encode the status value returned by waitpid()
+static inline int create_status_val(enum procstate state, int xstate)
+{
+  return (((int) (state == STOPPED) << 8) & 0xFF00) | (xstate & 0xFF);
+}
+
+int
+waitpid(int pid, uint64 status, int options)
+{
+  struct proc *np;
+  struct proc *p = myproc();
+  int found_child = 0;
+  int status_val = 0;
+
+  if (pid <= 0){
+    return -1;  // Not supported 
+  }
+
+  acquire(&wait_lock);
+
+  for (;;) {
+    // Scan through table looking for exited or stopped children.
+    for (np = proc; np < &proc[NPROC]; np++) {
+      if (np->parent == p) {
+        // make sure the child isn't still in exit() or swtch().
+        acquire(&np->lock);
+
+        if (np->pid != pid) {
+          release(&np->lock);
+          continue;
+        }
+
+        found_child = 1;
+
+        if (np->state == ZOMBIE ||
+            ((np->state == STOPPED) && (options & WUNTRACED))) {
+          // Found one.
+          status_val = create_status_val(np->state, np->xstate); 
+          if(status != 0 && copyout(p->pagetable, status, (char *) &status_val,
+                                  sizeof(status_val)) < 0) {
+            release(&np->lock);
+            release(&wait_lock);
+            return -1;
+          }
+          if (np->state == ZOMBIE) {
+            freeproc(np);
+          }
+          release(&np->lock);
+          release(&wait_lock);
+          return pid;
+        }
+
+        release(&np->lock);
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!found_child || p->killed || (options & WNOHANG)){
+      release(&wait_lock);
+      return -1;
+    }
+
+    // Wait for a child to exit or stop.
+    sleep(p, &wait_lock);  //DOC: wait-sleep
+  }
+}
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -637,7 +710,8 @@ procdump(void)
   [SLEEPING]  "sleep ",
   [RUNNABLE]  "runble",
   [RUNNING]   "run   ",
-  [ZOMBIE]    "zombie"
+  [ZOMBIE]    "zombie",
+  [STOPPED]   "stopped"
   };
   struct proc *p;
   char *state;
@@ -652,5 +726,168 @@ procdump(void)
       state = "???";
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
+  }
+}
+
+void ptrace_syscall_enter(struct proc *p)
+{
+  if (!p->traceflags.syscall) {
+      return;
+  }
+
+  acquire(&wait_lock);
+  acquire(&p->lock);
+
+  p->traceflags.syscall = 0;
+  p->traceflags.syscall_state = PTRACE_SYSCALL_INFO_ENTRY;
+  p->state = STOPPED;
+
+  wakeup(p->parent);
+  release(&wait_lock);
+
+  sched();
+  release(&p->lock);
+}
+
+void ptrace_syscall_exit(struct proc *p)
+{
+  if (!p->traceflags.syscall) {
+      return;
+  }
+
+  acquire(&wait_lock);
+  acquire(&p->lock);
+
+  p->traceflags.syscall = 0;
+  p->traceflags.syscall_state = PTRACE_SYSCALL_INFO_EXIT;
+  p->state = STOPPED;
+
+  wakeup(p->parent);
+  release(&wait_lock);
+
+  sched();
+  release(&p->lock);
+}
+
+static uint64 ptrace_traceme(int pid, uint64 addr, uint64 data)
+{
+  struct proc *p = myproc();
+
+  acquire(&p->lock);
+  p->traceflags.traceable = 1;
+  p->state = STOPPED;
+
+  acquire(&wait_lock);
+  wakeup(p->parent);
+  release(&wait_lock);
+
+  sched();
+  release(&p->lock);
+
+  return 0;
+}
+
+static uint64 ptrace_syscall(int pid, uint64 addr, uint64 data)
+{
+  int rc = -1; 
+  struct proc *np;
+  struct proc *p = myproc();
+
+  acquire(&wait_lock);
+  for (np = proc; np < &proc[NPROC]; np++) {
+    if (np->parent == p) {
+      acquire(&np->lock);
+      if (np->pid != pid) {
+        release(&np->lock);
+        continue;
+      }
+
+      if (!np->traceflags.traceable || np->state != STOPPED) {
+        release(&np->lock);
+        break;
+      }
+
+      np->traceflags.syscall = 1;
+      np->state = RUNNABLE;
+      release(&np->lock);
+      rc = 0;
+      break;
+    }
+  }
+  release(&wait_lock);
+
+  return rc;
+}
+
+static uint64 ptrace_get_syscall_info(int pid, uint64 addr, uint64 data)
+{
+  struct ptrace_syscall_info info;
+  struct proc *np;
+  struct proc *p = myproc();
+  int found = 0;
+  int valid = 0;
+
+  if (!data || addr < sizeof(info)) {
+    return -1;
+  }
+
+  acquire(&wait_lock);
+  for (np = proc; !found && np < &proc[NPROC]; np++) {
+    if (np->parent == p) {
+      acquire(&np->lock);
+      if (np->pid == pid) {
+        found = 1;
+      }
+      if (np->state == STOPPED && np->traceflags.traceable) {
+        info.op = np->traceflags.syscall_state;
+        info.instruction_pointer = np->trapframe->epc;
+        info.stack_pointer = np->trapframe->sp;
+        switch (info.op) {
+        case PTRACE_SYSCALL_INFO_ENTRY:
+          info.entry.nr = np->trapframe->a7;
+          info.entry.args[0] = np->trapframe->a0;
+          info.entry.args[1] = np->trapframe->a1;
+          info.entry.args[2] = np->trapframe->a2;
+          info.entry.args[3] = np->trapframe->a3;
+          info.entry.args[4] = np->trapframe->a4;
+          info.entry.args[5] = np->trapframe->a5;
+          break;
+        case PTRACE_SYSCALL_INFO_EXIT:
+          info.exit.rval = np->trapframe->a0;
+          info.exit.is_error = info.exit.rval != 0;  // Unsure if necessary
+          break;
+        default:
+          panic("process was stopped but syscall op was invalid");
+          break;
+        }
+
+        valid = 1;
+      }
+      release(&np->lock);
+    }
+  }
+  release(&wait_lock);
+
+  if (!valid) {
+    return -1;
+  }
+  if (copyout(p->pagetable, data, (char *) &info, sizeof(info)) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+uint64 ptrace(int request, int pid, uint64 addr, uint64 data)
+{
+  switch (request) {
+    case PTRACE_TRACEME:
+        return ptrace_traceme(pid, addr, data);
+    case PTRACE_SYSCALL:
+        return ptrace_syscall(pid, addr, data);
+    case PTRACE_GET_SYSCALL_INFO:
+        return ptrace_get_syscall_info(pid, addr, data);
+    default:
+        return -1;
   }
 }

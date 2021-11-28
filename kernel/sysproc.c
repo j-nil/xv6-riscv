@@ -6,6 +6,7 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "ptrace.h"
 
 uint64
 sys_exit(void)
@@ -36,6 +37,25 @@ sys_wait(void)
   if(argaddr(0, &p) < 0)
     return -1;
   return wait(p);
+}
+
+uint64 sys_waitpid(void)
+{
+  int pid;
+  uint64 status;
+  int options;
+
+  if (argint(0, &pid) < 0) {
+    return -1;
+  }
+  if (argaddr(1, &status) < 0) {
+    return -1;
+  }
+  if (argint(2, &options) < 0) {
+    return -1;
+  }
+
+  return waitpid(pid, status, options);
 }
 
 uint64
@@ -94,4 +114,31 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+/*
+ * Function signature:
+ * uint64 ptrace(int request, int pid, void *addr, void *data);
+ */
+uint64 sys_ptrace(void)
+{
+    int request;
+    int pid;
+    uint64 addr;
+    uint64 data;
+
+    if (argint(0, &request) < 0) {
+        return -1;
+    }
+    if (argint(1, &pid) < 0) {
+        return -1;
+    }
+    if (argaddr(2, &addr) < 0) {
+        return -1;
+    }
+    if (argaddr(3, &data) < 0) {
+        return -1;
+    }
+
+    return ptrace(request, pid, addr, data);
 }

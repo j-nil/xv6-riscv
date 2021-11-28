@@ -23,6 +23,8 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int ptrace(int request, int pid, void *addr, void *data);
+int waitpid(int pid, int *status, int options);
 
 // ulib.c
 int stat(const char*, struct stat*);

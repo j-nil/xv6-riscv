@@ -8,6 +8,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct trapframe;
 
 // bio.c
 void            binit(void);
@@ -99,11 +100,15 @@ void            sched(void);
 void            sleep(void*, struct spinlock*);
 void            userinit(void);
 int             wait(uint64);
+int             waitpid(int, uint64, int);
 void            wakeup(void*);
 void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+uint64          ptrace(int request, int pid, uint64 addr, uint64 data);
+void            ptrace_syscall_enter(struct proc *);
+void            ptrace_syscall_exit(struct proc *);
 
 // swtch.S
 void            swtch(struct context*, struct context*);

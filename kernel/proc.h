@@ -80,7 +80,13 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
-enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE, STOPPED };
+
+struct trace_flags {
+  uint8 traceable;      // Has the process called PTRACE_TRACEME?
+  uint8 syscall;        // Has the parent process called PTRACE_SYSCALL?
+  uint8 syscall_state;  // Last syscall state (entry/exit)
+};
 
 // Per-process state
 struct proc {
@@ -105,4 +111,5 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct trace_flags traceflags; // Flags for process tracing
 };
